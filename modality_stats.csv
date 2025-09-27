@@ -1,0 +1,5 @@
+csv_path,day,total,text_only,image_only,text_image,empty
+output/金价/2010-01-04.csv,2010-01-04,3,3,0,0,0
+output/金价/2010-01-05.csv,2010-01-05,2,1,0,1,0
+output/金价/2010-01-06.csv,2010-01-06,3,3,0,0,0
+TOTAL,TOTAL,8,7,0,1,0
