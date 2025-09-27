@@ -1,0 +1,16 @@
+/Users/mac/Documents/computerscience/1基于/贵重金属日交易/SocialData/Script/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+[INFO] 使用配置文件: config.yaml
+
+[DAY] 2022-01-02 开始抓取……
+[INFO] 2022-01-02 第1页: https://s.weibo.com/weibo?q=%E9%87%91%E4%BB%B7&typeall=1&suball=1&timescope=custom:2022-01-02-0:2022-01-02-23&Refer=g&page=1
+[INFO] 2022-01-02 第2页: https://s.weibo.com/weibo?q=%E9%87%91%E4%BB%B7&typeall=1&suball=1&timescope=custom:2022-01-02-0:2022-01-02-23&Refer=g&page=2
+[INFO] 2022-01-02 第3页: https://s.weibo.com/weibo?q=%E9%87%91%E4%BB%B7&typeall=1&suball=1&timescope=custom:2022-01-02-0:2022-01-02-23&Refer=g&page=3
+[INFO] 2022-01-02 第4页: https://s.weibo.com/weibo?q=%E9%87%91%E4%BB%B7&typeall=1&suball=1&timescope=custom:2022-01-02-0:2022-01-02-23&Refer=g&page=4
+[INFO] 2022-01-02 第5页: https://s.weibo.com/weibo?q=%E9%87%91%E4%BB%B7&typeall=1&suball=1&timescope=custom:2022-01-02-0:2022-01-02-23&Refer=g&page=5
+[INFO] 2022-01-02 第6页: https://s.weibo.com/weibo?q=%E9%87%91%E4%BB%B7&typeall=1&suball=1&timescope=custom:2022-01-02-0:2022-01-02-23&Refer=g&page=6
+[INFO] 2022-01-02 第7页: https://s.weibo.com/weibo?q=%E9%87%91%E4%BB%B7&typeall=1&suball=1&timescope=custom:2022-01-02-0:2022-01-02-23&Refer=g&page=7
+[INFO] 无结果或到达末尾，结束该日分页。
+[DAY] 2022-01-02 完成：49条，6页
+
+[SUMMARY] 完成：49 条帖子，覆盖 1 个有结果的日期。

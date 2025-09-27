@@ -1,0 +1,10 @@
+# Virtual environment
+.venv/
+
+# Generated media assets
+images/
+
+# Crawled/exported CSVs or other outputs
+output/
+
+weibo_search.db

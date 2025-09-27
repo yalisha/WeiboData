@@ -1,0 +1,28 @@
+# 配置说明：
+# - 将浏览器中已登录微博账号的 Cookie 粘贴到 cookie 字符串里。
+# - headers 可按需调整 UA 与语言；脚本会补充必须字段。
+# - 代理：默认关闭。可使用简单代理（http/https URL）。
+#
+# 注意：请遵守微博平台的服务条款与相关法律法规，合理控制访问频率，仅用于研究用途。
+
+cookie: "XSRF-TOKEN=48ce38;SUBP=0033WrSXqPxfM725Ws9jqgMF55529P9D9WWryGc_rkWJDwr8iPp_L5oZ5JpX5KMhUgL.Fo-71KzX1K5EeK-2dJLoIEXLxKnLBoqL1h-LxKMLB.2LBKMLxK-LBKBLBKMLxK-LB.eLBo.LxKML12qLBK5t;MLOGIN=1;SUB=_2A25F0uQrDeRhGeNO4lAV-S7OyjmIHXVmrnnjrDV6PUJbktAbLWvukW1NTrpcpp8bpc5stFMKot1gM_B-TZbJrP9I;ALF=1761485179;_T_WM=42233026436;M_WEIBOCN_PARAMS=uicode%3D20000174;mweibo_short_token=dae2b32ec5;SCF=AtJuWFzDIvFMh7Xx2rvTOBPQopqM0lysDXpwSyH_IvFl25Tux0K8KS9ZtlE2pzIdqzvf7mJl8O9yjuA19orFAAI.;SSOLoginState=1758893179;WEIBOCN_FROM=1110006030"
+
+headers:
+  User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  Accept-Language: "zh-CN,zh;q=0.9"
+
+proxy:
+  enable: false
+  mode: "simple"  # simple | mediacrawlerpro（预留）
+  http: ""       # 例如：http://user:pass@ip:port
+  https: ""
+
+defaults:
+  # 默认每日最大页数（微博通常最多 50 页）
+  max_pages_per_day: 50
+  # 默认请求的随机等待时间（秒）区间
+  min_interval: 1.2
+  max_interval: 3.5
+  # 默认日期范围（未在 CLI 指定时生效）
+  start_date: "2022-01-01"
+  end_date: ""  # 留空=自动使用今天

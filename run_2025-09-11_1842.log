@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/Users/mac/Documents/computerscience/1基于/贵重金属日交易/SocialData/Script/weibo_advanced_search.py", line 40, in <module>
+    import requests
+ModuleNotFoundError: No module named 'requests'
