@@ -15,15 +15,16 @@ Usage example (from repo root):
     python classify_media.py \
         --images-root images/金价 \
         --csv-root output/金价 \
-        --output classified_gold_images.csv \
-        --profile mac-cpu
+        --output classified_posts.csv \
+        --profile mac-cpu \
+        --aggregation post
 
 The script relies on ``open_clip`` with a hardware-aware preset (可用``--profile``覆盖). Install
 requirements if needed:
 
     pip install open_clip_torch torch torchvision pandas pillow tqdm
 
-输出字段会包含 ``second_best``、``confidence_gap``、``low_confidence``，以及 ``used_text``（仅当图片文件名包含对应 ``post_id`` 时才会融合文本特征）。若提供 ``--image-proto-root``，脚本还会将少量人工样例图片编码为类别原型，以提升区分度。
+输出字段会包含 ``modality``、文本情绪/主题、图像主类分布以及逐图置信度；当使用 ``--aggregation image`` 时，会保留逐张图片的分类详情。若提供 ``--image-proto-root``，脚本还会将少量人工样例图片编码为类别原型，以提升区分度。
 """
 from __future__ import annotations
 
@@ -31,12 +32,19 @@ import argparse
 import json
 import logging
 import sys
-from dataclasses import dataclass
+import math
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 from PIL import Image
+
+try:
+    import pytesseract  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    pytesseract = None
 
 try:
     import torch
@@ -54,6 +62,121 @@ LOGGER = logging.getLogger("classify_media")
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 MAX_IMAGE_PROTOTYPES = 64
+
+POSITIVE_TERMS = {
+    "上涨",
+    "大涨",
+    "利好",
+    "赚钱",
+    "盈利",
+    "走强",
+    "看涨",
+    "高位",
+    "突破",
+    "乐观",
+    "飙升",
+    "涨停",
+    "走高",
+    "飙涨",
+    "复苏",
+    "增持",
+    "买入",
+    "强势",
+}
+
+NEGATIVE_TERMS = {
+    "下跌",
+    "大跌",
+    "利空",
+    "亏损",
+    "风险",
+    "抛售",
+    "看跌",
+    "暴跌",
+    "回调",
+    "崩盘",
+    "暴雷",
+    "踩雷",
+    "爆仓",
+    "承压",
+    "缩水",
+    "疲软",
+}
+
+TOPIC_KEYWORDS: Dict[str, Sequence[str]] = {
+    "macro": ("美联储", "央行", "利率", "通胀", "加息", "宏观", "货币政策", "GDP"),
+    "technical": ("支撑", "阻力", "K线", "均线", "技术面", "形态", "指标", "波段"),
+    "jewelry": ("首饰", "珠宝", "金店", "克价", "黄金首饰", "首饰店"),
+    "meme_text": ("哈哈", "笑死", "梗", "表情包", "段子", "吐槽"),
+    "risk": ("风险", "暴跌", "爆仓", "踩雷", "危机", "衰退"),
+}
+
+DEFAULT_DETAIL_TAG = {
+    "technical_chart": "technical_chart.general",
+    "news_screenshot": "news.general",
+    "gold_bullion": "gold_bullion.product",
+    "meme": "meme.general",
+    "irrelevant": "noise",
+}
+
+DETAIL_PROMPTS: Dict[str, Dict[str, Sequence[str]]] = {
+    "technical_chart": {
+        "technical_chart.up": (
+            "an upward trending financial candlestick chart",
+            "股票价格持续上涨的K线图",
+            "bullish chart with higher highs",
+        ),
+        "technical_chart.down": (
+            "a downward trending candlestick chart",
+            "显示价格下跌的黄金K线图",
+            "bearish chart with lower lows",
+        ),
+        "technical_chart.sideways": (
+            "a sideways consolidation candlestick chart",
+            "横盘震荡的金融走势图",
+            "price ranging without clear trend",
+        ),
+        "technical_chart.uncertain": (
+            "a noisy candlestick chart without clear trend",
+            "震荡且方向不明的K线图",
+            "messy mixed signals trading chart",
+        ),
+    },
+    "gold_bullion": {
+        "gold_bullion.bar": (
+            "stacked gold bars",
+            "整齐摆放的金条",
+        ),
+        "gold_bullion.coin": (
+            "gold coins on a table",
+            "金币收藏展示",
+        ),
+        "gold_bullion.jewelry": (
+            "gold jewelry display in a shop",
+            "黄金首饰佩戴展示",
+        ),
+        "gold_bullion.packaging": (
+            "gold gift box and packaging",
+            "金店礼盒与包装袋",
+        ),
+    },
+    "meme": {
+        "meme.positive": (
+            "a funny optimistic meme about making money",
+            "积极搞笑的理财表情包",
+            "a cheerful investing meme",
+        ),
+        "meme.negative": (
+            "a pessimistic meme about losses",
+            "抱怨亏损的投资梗图",
+            "a sad investing meme",
+        ),
+        "meme.neutral": (
+            "a neutral meme without strong emotion",
+            "普通的财经梗图",
+        ),
+    },
+}
 
 # Default bilingual prompts for each category. Multiple phrasings improve
 # zero-shot performance without any fine-tuning.
@@ -97,13 +220,51 @@ DEFAULT_CATEGORY_PROMPTS: Dict[str, Sequence[str]] = {
 
 
 @dataclass
-class DataPoint:
-    image_path: Path
+class TextAnalysis:
+    raw_text: str
+    has_text: bool
+    sentiment: str
+    sentiment_score: float
+    positive_hits: List[str] = field(default_factory=list)
+    negative_hits: List[str] = field(default_factory=list)
+    topics: List[str] = field(default_factory=list)
+    length: int = 0
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "text_has_content": self.has_text,
+            "text_sentiment": self.sentiment,
+            "text_sentiment_score": self.sentiment_score,
+            "text_positive_hits": ";".join(self.positive_hits),
+            "text_negative_hits": ";".join(self.negative_hits),
+            "text_topics": ";".join(self.topics),
+            "text_length": self.length,
+            "text_preview": self.raw_text[:120],
+        }
+
+
+@dataclass
+class PostRecord:
     csv_path: Path
     post_id: str
     text: str
     day: Optional[str]
     row_index: int
+    image_paths: List[Path] = field(default_factory=list)
+    text_analysis: Optional[TextAnalysis] = None
+    modality: Optional[str] = None
+
+    def has_text(self) -> bool:
+        return bool(self.text and self.text.strip())
+
+    def has_image(self) -> bool:
+        return bool(self.image_paths)
+
+
+@dataclass
+class DataPoint:
+    post: PostRecord
+    image_path: Path
 
 
 @dataclass
@@ -120,6 +281,10 @@ class ClassificationResult:
     used_text: bool
     day: Optional[str]
     row_index: int
+    post: PostRecord
+    detail_tag: str
+    detail_scores: Dict[str, Any]
+    ocr_text: str
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -145,6 +310,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         default=Path("classified_images.csv"),
         help="Where to write the classification results (CSV).",
+    )
+    parser.add_argument(
+        "--aggregation",
+        choices=["post", "image"],
+        default="post",
+        help="Aggregation level of the output CSV (post-level summary or per-image records).",
     )
     parser.add_argument(
         "--profile",
@@ -334,6 +505,174 @@ def resolve_batch_size(
     return 4
 
 
+def normalize_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ""
+        return str(value)
+    result = str(value).strip()
+    if result.lower() in {"nan", "none", "null"}:
+        return ""
+    return result
+
+
+def determine_modality_flags(has_text: bool, has_image: bool) -> str:
+    if has_text and has_image:
+        return "text_image"
+    if has_text:
+        return "text_only"
+    if has_image:
+        return "image_only"
+    return "empty"
+
+
+def determine_modality(post: PostRecord) -> str:
+    return determine_modality_flags(post.has_text(), post.has_image())
+
+
+def analyze_text(text: str) -> TextAnalysis:
+    cleaned = text.strip() if text else ""
+    if not cleaned:
+        return TextAnalysis(
+            raw_text="",
+            has_text=False,
+            sentiment="none",
+            sentiment_score=0.0,
+            topics=[],
+            positive_hits=[],
+            negative_hits=[],
+            length=0,
+        )
+
+    pos_hits = [word for word in POSITIVE_TERMS if word in cleaned]
+    neg_hits = [word for word in NEGATIVE_TERMS if word in cleaned]
+    score = float(len(pos_hits) - len(neg_hits))
+    if score > 0:
+        sentiment = "positive"
+    elif score < 0:
+        sentiment = "negative"
+    else:
+        sentiment = "neutral"
+
+    topics: List[str] = []
+    for topic, keywords in TOPIC_KEYWORDS.items():
+        if any(keyword in cleaned for keyword in keywords):
+            topics.append(topic)
+
+    return TextAnalysis(
+        raw_text=cleaned,
+        has_text=True,
+        sentiment=sentiment,
+        sentiment_score=score,
+        positive_hits=pos_hits,
+        negative_hits=neg_hits,
+        topics=topics,
+        length=len(cleaned),
+    )
+
+
+def perform_ocr(image_path: Path) -> str:
+    if pytesseract is None:
+        return ""
+    try:
+        with Image.open(image_path) as img:
+            gray = img.convert("L")
+        text = pytesseract.image_to_string(gray, lang="chi_sim+eng")
+        return text.strip()
+    except Exception as exc:  # pragma: no cover - OCR is best-effort
+        LOGGER.debug("OCR failed for %s: %s", image_path, exc)
+        return ""
+
+
+def analysis_to_brief_dict(analysis: TextAnalysis) -> Dict[str, Any]:
+    return {
+        "sentiment": analysis.sentiment,
+        "sentiment_score": analysis.sentiment_score,
+        "positive_hits": ";".join(analysis.positive_hits),
+        "negative_hits": ";".join(analysis.negative_hits),
+        "topics": ";".join(analysis.topics),
+        "length": analysis.length,
+    }
+
+
+def select_detail_from_prototypes(
+    category: str,
+    feature: torch.Tensor,
+    detail_prototypes: Dict[str, Dict[str, torch.Tensor]],
+) -> Tuple[str, Dict[str, Any]]:
+    bucket = detail_prototypes.get(category)
+    if not bucket:
+        return DEFAULT_DETAIL_TAG.get(category, ""), {}
+    sims: Dict[str, float] = {}
+    for key, proto in bucket.items():
+        sims[key] = float((feature @ proto).item())
+    best_key = max(sims, key=sims.get)
+    rounded = {k: round(v, 4) for k, v in sims.items()}
+    return best_key, {"detail_similarities": rounded}
+
+
+def merge_sentiment_detail(prefix: str, analysis: TextAnalysis) -> Tuple[str, Dict[str, Any]]:
+    detail_tag = f"{prefix}.{analysis.sentiment}"
+    detail_scores = analysis_to_brief_dict(analysis)
+    return detail_tag, detail_scores
+
+
+def determine_detail_for_image(
+    category: str,
+    feature: torch.Tensor,
+    dp: DataPoint,
+    detail_prototypes: Dict[str, Dict[str, torch.Tensor]],
+) -> Tuple[str, Dict[str, Any], str]:
+    detail_tag = DEFAULT_DETAIL_TAG.get(category, "")
+    detail_scores: Dict[str, Any] = {}
+    ocr_text = ""
+
+    if category == "news_screenshot":
+        ocr_text = perform_ocr(dp.image_path)
+        source_text = ocr_text or dp.post.text
+        analysis = analyze_text(source_text)
+        detail_tag, detail_scores = merge_sentiment_detail("news", analysis)
+        detail_scores["sentiment_source"] = "ocr" if ocr_text else "post"
+        detail_scores["ocr_length"] = len(ocr_text)
+    elif category == "technical_chart":
+        detail_tag, detail_scores = select_detail_from_prototypes(
+            category, feature, detail_prototypes
+        )
+        if detail_scores:
+            detail_scores["source"] = "clip"
+    elif category == "gold_bullion":
+        detail_tag, detail_scores = select_detail_from_prototypes(
+            category, feature, detail_prototypes
+        )
+        if detail_scores:
+            detail_scores["source"] = "clip"
+    elif category == "meme":
+        ocr_text = perform_ocr(dp.image_path)
+        combined_text = "\n".join(filter(None, [dp.post.text, ocr_text]))
+        analysis = analyze_text(combined_text)
+        detail_tag, detail_scores = merge_sentiment_detail("meme", analysis)
+        detail_scores["sentiment_source"] = "text+ocr" if ocr_text else "post"
+        detail_scores["ocr_length"] = len(ocr_text)
+        clip_tag, clip_scores = select_detail_from_prototypes(
+            category, feature, detail_prototypes
+        )
+        if clip_scores:
+            detail_scores["clip_detail"] = clip_tag
+            detail_scores["clip_scores"] = clip_scores.get("detail_similarities")
+    else:
+        if category in detail_prototypes:
+            detail_tag, detail_scores = select_detail_from_prototypes(
+                category, feature, detail_prototypes
+            )
+
+    if not detail_tag:
+        detail_tag = DEFAULT_DETAIL_TAG.get(category, "")
+
+    return detail_tag, detail_scores, ocr_text
+
+
 def load_category_prompts(custom: Optional[Path]) -> Dict[str, Sequence[str]]:
     if custom is None:
         return DEFAULT_CATEGORY_PROMPTS
@@ -371,33 +710,40 @@ def split_image_paths(value: str) -> Iterable[str]:
             yield trimmed
 
 
-def collect_datapoints(csv_paths: Sequence[Path], limit: Optional[int]) -> List[DataPoint]:
-    datapoints: List[DataPoint] = []
+def collect_posts(csv_paths: Sequence[Path], limit: Optional[int]) -> List[PostRecord]:
+    posts: List[PostRecord] = []
     for csv_path in csv_paths:
         df = pd.read_csv(csv_path)
         for idx, row in df.iterrows():
-            image_field = str(row.get("image_paths", "") or "").strip()
-            if not image_field:
-                continue
-            post_id = str(row.get("post_id", ""))
-            text = str(row.get("text", "") or "")
-            day = str(row.get("day") or "") or None
-            for raw_path in split_image_paths(image_field):
-                image_path = Path(raw_path)
-                datapoints.append(
-                    DataPoint(
-                        image_path=image_path,
-                        csv_path=csv_path,
-                        post_id=post_id,
-                        text=text,
-                        day=day,
-                        row_index=int(idx),
-                    )
-                )
-                if limit is not None and len(datapoints) >= limit:
-                    return datapoints
-    if not datapoints:
-        raise RuntimeError("No images discovered from the provided CSV files.")
+            text = normalize_str(row.get("text"))
+            post_id = normalize_str(row.get("post_id")) or f"{csv_path.stem}-{idx}"
+            day_value = normalize_str(row.get("day")) or None
+            image_field = normalize_str(row.get("image_paths"))
+            image_paths = [Path(path) for path in split_image_paths(image_field)] if image_field else []
+
+            post = PostRecord(
+                csv_path=csv_path,
+                post_id=post_id,
+                text=text,
+                day=day_value,
+                row_index=int(idx),
+                image_paths=image_paths,
+            )
+            posts.append(post)
+            if limit is not None and len(posts) >= limit:
+                return posts
+    if not posts:
+        raise RuntimeError("No posts discovered from the provided CSV files.")
+    return posts
+
+
+def build_image_datapoints(posts: Sequence[PostRecord], limit: Optional[int]) -> List[DataPoint]:
+    datapoints: List[DataPoint] = []
+    for post in posts:
+        for image_path in post.image_paths:
+            datapoints.append(DataPoint(post=post, image_path=image_path))
+            if limit is not None and len(datapoints) >= limit:
+                return datapoints
     return datapoints
 
 
@@ -433,7 +779,7 @@ def encode_category_prototypes(
     image_proto_root: Optional[Path],
     proto_text_weight: float,
     proto_image_weight: float,
-) -> Dict[str, torch.Tensor]:
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Dict[str, torch.Tensor]]]:
     text_prototypes: Dict[str, torch.Tensor] = {}
     with torch.no_grad():
         for name, prompts in categories.items():
@@ -479,6 +825,23 @@ def encode_category_prototypes(
             image_prototypes[name] = proto
             LOGGER.info("类别 %s : 加载了 %d 张样例图片用于原型", name, len(image_tensors))
 
+    detail_prototypes: Dict[str, Dict[str, torch.Tensor]] = {}
+    with torch.no_grad():
+        for category, detail_map in DETAIL_PROMPTS.items():
+            proto_bucket: Dict[str, torch.Tensor] = {}
+            for detail_key, prompts in detail_map.items():
+                prompt_list = expand_prompts(prompts)
+                if not prompt_list:
+                    continue
+                tokens = tokenizer(prompt_list).to(device)
+                features = model.encode_text(tokens)
+                features = features / features.norm(dim=-1, keepdim=True)
+                proto = features.mean(dim=0)
+                proto = proto / proto.norm()
+                proto_bucket[detail_key] = proto
+            if proto_bucket:
+                detail_prototypes[category] = proto_bucket
+
     prototypes: Dict[str, torch.Tensor] = {}
     for name in categories.keys():
         components: List[torch.Tensor] = []
@@ -499,7 +862,7 @@ def encode_category_prototypes(
         combined = combined / combined.norm()
         prototypes[name] = combined
 
-    return prototypes
+    return prototypes, detail_prototypes
 
 
 def image_to_tensor(image_path: Path, preprocess) -> torch.Tensor:
@@ -509,17 +872,18 @@ def image_to_tensor(image_path: Path, preprocess) -> torch.Tensor:
 
 
 def should_use_text(dp: DataPoint) -> bool:
-    if not dp.post_id:
+    post = dp.post
+    if not post.post_id:
         return False
-    if not (dp.text and dp.text.strip()):
+    if not post.has_text():
         return False
     filename = dp.image_path.name
     if not filename:
         return False
-    if dp.post_id in filename:
+    if post.post_id in filename:
         return True
     stem = dp.image_path.stem
-    return bool(stem and stem.startswith(dp.post_id))
+    return bool(stem and stem.startswith(post.post_id))
 
 
 def encode_batch(
@@ -563,7 +927,7 @@ def encode_batch(
             continue
         if not should_use_text(dp):
             continue
-        txt = (dp.text or "").strip()
+        txt = (dp.post.text or "").strip()
         if not txt:
             continue
         texts_to_encode.append(txt)
@@ -600,6 +964,7 @@ def classify_datapoints(
     preprocess,
     device: torch.device,
     prototypes: Dict[str, torch.Tensor],
+    detail_prototypes: Dict[str, Dict[str, torch.Tensor]],
     text_weight: float,
     batch_size: int,
     min_confidence: float,
@@ -630,6 +995,7 @@ def classify_datapoints(
 
         for local_idx, sim_vector in enumerate(similarities):
             dp = batch[valid_indices[local_idx]]
+            feature = combined_features[local_idx]
             scores = sim_vector.detach().cpu()
             ranked = {name: float(scores[i].item()) for i, name in enumerate(prototype_names)}
 
@@ -647,11 +1013,15 @@ def classify_datapoints(
             gap = best_score - second_best_score if second_best_score >= 0 else 1.0
             low_confidence = bool(best_score < min_confidence or gap < min_gap)
 
+            detail_tag, detail_scores, ocr_text = determine_detail_for_image(
+                prototype_names[best_idx], feature, dp, detail_prototypes
+            )
+
             results.append(
                 ClassificationResult(
                     image_path=dp.image_path,
-                    csv_path=dp.csv_path,
-                    post_id=dp.post_id,
+                    csv_path=dp.post.csv_path,
+                    post_id=dp.post.post_id,
                     assigned_category=prototype_names[best_idx],
                     confidence=best_score,
                     ranked_scores=ranked,
@@ -659,8 +1029,12 @@ def classify_datapoints(
                     second_best=second_best_name,
                     low_confidence=low_confidence,
                     used_text=used_text_flags[local_idx],
-                    day=dp.day,
-                    row_index=dp.row_index,
+                    day=dp.post.day,
+                    row_index=dp.post.row_index,
+                    post=dp.post,
+                    detail_tag=detail_tag,
+                    detail_scores=detail_scores,
+                    ocr_text=ocr_text,
                 )
             )
 
@@ -672,6 +1046,9 @@ def results_to_dataframe(results: Sequence[ClassificationResult]) -> pd.DataFram
         raise RuntimeError("No classification results produced.")
     records = []
     for res in results:
+        post = res.post
+        text_info = post.text_analysis or analyze_text(post.text)
+        modality = post.modality or determine_modality(post)
         records.append(
             {
                 "image_path": str(res.image_path),
@@ -679,15 +1056,156 @@ def results_to_dataframe(results: Sequence[ClassificationResult]) -> pd.DataFram
                 "post_id": res.post_id,
                 "day": res.day,
                 "row_index": res.row_index,
+                "modality": modality,
+                "has_text": post.has_text(),
+                "has_image": post.has_image(),
                 "category": res.assigned_category,
                 "confidence": res.confidence,
                 "second_best": res.second_best,
                 "confidence_gap": res.confidence_gap,
                 "low_confidence": res.low_confidence,
                 "used_text": res.used_text,
+                "images_in_post": len(post.image_paths),
+                "detail_tag": res.detail_tag,
+                "detail_scores": json.dumps(res.detail_scores, ensure_ascii=False),
+                "ocr_text_preview": res.ocr_text[:160],
+                "ocr_text_length": len(res.ocr_text),
+                **text_info.as_dict(),
                 "scores": json.dumps(res.ranked_scores, ensure_ascii=False),
             }
         )
+    return pd.DataFrame.from_records(records)
+
+
+def summarise_image_results(results: Sequence[ClassificationResult]) -> Dict[str, Any]:
+    if not results:
+        return {
+            "image_main_category": "",
+            "image_detail_tag": "",
+            "image_main_confidence": 0.0,
+            "images_classified": 0,
+            "image_category_counts": json.dumps({}, ensure_ascii=False),
+            "image_category_confidence": json.dumps({}, ensure_ascii=False),
+            "image_low_confidence_count": 0,
+            "image_used_text_ratio": 0.0,
+        }
+
+    count_by_cat: Dict[str, int] = defaultdict(int)
+    confidence_sum: Dict[str, float] = defaultdict(float)
+    detail_count: Dict[str, int] = defaultdict(int)
+    detail_confidence_sum: Dict[str, float] = defaultdict(float)
+    detail_meta: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    ocr_texts: List[str] = []
+    low_confidence_count = 0
+    used_text_count = 0
+
+    for res in results:
+        cat = res.assigned_category
+        count_by_cat[cat] += 1
+        confidence_sum[cat] += res.confidence
+        if res.low_confidence:
+            low_confidence_count += 1
+        if res.used_text:
+            used_text_count += 1
+        if res.detail_tag:
+            detail_count[res.detail_tag] += 1
+            detail_confidence_sum[res.detail_tag] += res.confidence
+            if res.detail_scores:
+                detail_meta[res.detail_tag].append(res.detail_scores)
+        if res.ocr_text:
+            ocr_texts.append(res.ocr_text)
+
+    def score_key(item: Tuple[str, float]) -> Tuple[float, int]:
+        cat, score_sum = item
+        return (score_sum, count_by_cat.get(cat, 0))
+
+    best_cat = max(confidence_sum.items(), key=score_key)[0]
+    avg_confidence = {
+        cat: confidence_sum[cat] / count_by_cat[cat]
+        for cat in count_by_cat
+        if count_by_cat[cat] > 0
+    }
+
+    detail_tag = DEFAULT_DETAIL_TAG.get(best_cat, "")
+
+    avg_detail_confidence = {
+        tag: detail_confidence_sum[tag] / detail_count[tag]
+        for tag in detail_count
+        if detail_count[tag] > 0
+    }
+
+    best_detail = detail_tag
+    detail_candidates = {
+        tag: detail_count[tag]
+        for tag in detail_count
+        if tag.startswith(best_cat)
+    }
+    if detail_candidates:
+        best_detail = max(
+            detail_candidates.items(),
+            key=lambda item: (item[1], avg_detail_confidence.get(item[0], 0.0)),
+        )[0]
+
+    return {
+        "image_main_category": best_cat,
+        "image_detail_tag": best_detail,
+        "image_main_confidence": round(avg_confidence.get(best_cat, 0.0), 4),
+        "images_classified": len(results),
+        "image_category_counts": json.dumps(dict(count_by_cat), ensure_ascii=False),
+        "image_category_confidence": json.dumps({cat: round(avg_confidence.get(cat, 0.0), 4) for cat in avg_confidence}, ensure_ascii=False),
+        "image_low_confidence_count": low_confidence_count,
+        "image_used_text_ratio": round(used_text_count / len(results), 4),
+        "image_detail_counts": json.dumps(dict(detail_count), ensure_ascii=False),
+        "image_detail_confidence": json.dumps(
+            {tag: round(avg_detail_confidence.get(tag, 0.0), 4) for tag in avg_detail_confidence},
+            ensure_ascii=False,
+        ),
+        "image_detail_metadata": json.dumps(
+            {
+                tag: {
+                    "count": detail_count[tag],
+                    "avg_confidence": round(avg_detail_confidence.get(tag, 0.0), 4),
+                    "examples": detail_meta[tag][:3],
+                }
+                for tag in detail_meta
+            },
+            ensure_ascii=False,
+        ),
+        "image_ocr_preview": " | ".join(text[:80] for text in ocr_texts[:3]),
+        "image_ocr_count": len(ocr_texts),
+    }
+
+
+def aggregate_posts_to_dataframe(
+    posts: Sequence[PostRecord],
+    image_results: Sequence[ClassificationResult],
+) -> pd.DataFrame:
+    grouped: Dict[int, List[ClassificationResult]] = defaultdict(list)
+    for res in image_results:
+        grouped[id(res.post)].append(res)
+
+    records = []
+    for post in posts:
+        text_info = post.text_analysis or analyze_text(post.text)
+        modality = post.modality or determine_modality(post)
+        image_summary = summarise_image_results(grouped.get(id(post), []))
+        record = {
+            "csv_path": str(post.csv_path),
+            "post_id": post.post_id,
+            "day": post.day,
+            "row_index": post.row_index,
+            "modality": modality,
+            "has_text": post.has_text(),
+            "has_image": post.has_image(),
+            "images_total": len(post.image_paths),
+            **image_summary,
+            **text_info.as_dict(),
+        }
+        records.append(record)
+
+    if not records:
+        raise RuntimeError("No posts available for aggregation.")
+
     return pd.DataFrame.from_records(records)
 
 
@@ -697,50 +1215,92 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     categories = load_category_prompts(args.categories)
     csv_files = find_csv_files(args.csv_root, args.date)
-    datapoints = collect_datapoints(csv_files, args.limit)
+    post_limit = args.limit if args.aggregation == "post" else None
+    posts = collect_posts(csv_files, post_limit)
 
-    LOGGER.info("Discovered %d images from %d CSV files", len(datapoints), len(csv_files))
+    for post in posts:
+        post.text_analysis = analyze_text(post.text)
+        post.modality = determine_modality(post)
+
+    image_limit = args.limit if args.aggregation == "image" else None
+    datapoints = build_image_datapoints(posts, image_limit)
+
+    posts_with_images = sum(1 for post in posts if post.has_image())
+    LOGGER.info(
+        "Loaded %d posts (%d with images) from %d CSV files; total images queued=%d",
+        len(posts),
+        posts_with_images,
+        len(csv_files),
+        len(datapoints),
+    )
 
     if args.dry_run:
-        for dp in datapoints[: args.limit or 20]:
-            LOGGER.info("Would process %s (post %s)", dp.image_path, dp.post_id)
+        preview_count = min(len(posts), args.limit or 10)
+        for post in posts[:preview_count]:
+            text_info = post.text_analysis or analyze_text(post.text)
+            LOGGER.info(
+                "Post %s modality=%s images=%d sentiment=%s topics=%s",
+                post.post_id,
+                post.modality,
+                len(post.image_paths),
+                text_info.sentiment,
+                ",".join(text_info.topics),
+            )
+        if args.aggregation == "image":
+            for dp in datapoints[: args.limit or 20]:
+                LOGGER.info(
+                    "Would process image %s (post %s)",
+                    dp.image_path,
+                    dp.post.post_id,
+                )
         LOGGER.info("Dry run complete; exiting without classification.")
         return 0
 
-    device = resolve_device(args.device, args.profile)
-    model_name, pretrained = resolve_model_and_pretrained(
-        args.model, args.pretrained, args.profile, device
-    )
-    batch_size = resolve_batch_size(args.batch_size, args.profile, device)
+    image_results: List[ClassificationResult] = []
 
-    LOGGER.info("使用计算设备: %s", device)
-    LOGGER.info("加载模型: %s (%s), batch_size=%d", model_name, pretrained, batch_size)
+    if datapoints:
+        device = resolve_device(args.device, args.profile)
+        model_name, pretrained = resolve_model_and_pretrained(
+            args.model, args.pretrained, args.profile, device
+        )
+        batch_size = resolve_batch_size(args.batch_size, args.profile, device)
 
-    model, preprocess, tokenizer = load_model_and_tokenizer(model_name, pretrained, device)
-    prototypes = encode_category_prototypes(
-        model=model,
-        tokenizer=tokenizer,
-        categories=categories,
-        device=device,
-        preprocess=preprocess,
-        image_proto_root=args.image_proto_root,
-        proto_text_weight=args.proto_text_weight,
-        proto_image_weight=args.proto_image_weight,
-    )
-    results = classify_datapoints(
-        datapoints=datapoints,
-        model=model,
-        tokenizer=tokenizer,
-        preprocess=preprocess,
-        device=device,
-        prototypes=prototypes,
-        text_weight=args.text_weight,
-        batch_size=batch_size,
-        min_confidence=args.min_confidence,
-        min_gap=args.min_gap,
-    )
+        LOGGER.info("使用计算设备: %s", device)
+        LOGGER.info("加载模型: %s (%s), batch_size=%d", model_name, pretrained, batch_size)
 
-    df = results_to_dataframe(results)
+        model, preprocess, tokenizer = load_model_and_tokenizer(model_name, pretrained, device)
+        prototypes, detail_prototypes = encode_category_prototypes(
+            model=model,
+            tokenizer=tokenizer,
+            categories=categories,
+            device=device,
+            preprocess=preprocess,
+            image_proto_root=args.image_proto_root,
+            proto_text_weight=args.proto_text_weight,
+            proto_image_weight=args.proto_image_weight,
+        )
+        image_results = classify_datapoints(
+            datapoints=datapoints,
+            model=model,
+            tokenizer=tokenizer,
+            preprocess=preprocess,
+            device=device,
+            prototypes=prototypes,
+            detail_prototypes=detail_prototypes,
+            text_weight=args.text_weight,
+            batch_size=batch_size,
+            min_confidence=args.min_confidence,
+            min_gap=args.min_gap,
+        )
+    else:
+        LOGGER.info("No images detected in selected posts; skipping image classification stage.")
+
+    if args.aggregation == "image":
+        if not image_results:
+            raise RuntimeError("Image aggregation requested but no image results were produced.")
+        df = results_to_dataframe(image_results)
+    else:
+        df = aggregate_posts_to_dataframe(posts, image_results)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.output, index=False)
     LOGGER.info("Wrote %s", args.output)
