@@ -7,5 +7,6 @@ images/
 # Crawled/exported CSVs or other outputs
 output/
 batch_results/
+feature_exports/
 
 weibo_search.db

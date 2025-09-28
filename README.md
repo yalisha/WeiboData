@@ -36,3 +36,75 @@ meme：通过文本 + 图像情绪判断正负面，输出情绪标签。
 编写命令或脚本实现批量日期处理、日志记录和错误告警。
 根据需要拓展到其他关键词或项目（如比特币、景区预测），复用流程。# WeiboData
 # WeiboData
+
+
+## 使用指南
+
+### 环境准备
+
+1. **Conda/Python**：推荐在 `conda` 环境中执行（示例 `WeiboA`）。
+   ```bash
+   conda activate WeiboA
+   pip install open_clip_torch torch torchvision pandas pillow tqdm numpy pytesseract
+   ```
+2. **Tesseract OCR（含中文语言包）**：
+   ```bash
+   brew install tesseract tesseract-lang  # macOS 示例
+   # 或手动将 chi_sim.traineddata、chi_tra.traineddata 下载至 $(tesseract --print-tessdata-dir)
+   ```
+   如需指定执行路径，可在 Python 中设置 `pytesseract.pytesseract.tesseract_cmd = "/usr/local/bin/tesseract"`。
+3. **目录约定**：保持 `output/<关键词>`（每日一个 CSV）、`images/<关键词>`（按日期存图）、`prototypes/<类别>`（细粒度原型）与脚本路径一致；`.gitignore` 已排除 `batch_results/`、`feature_exports/` 等产物目录。
+
+### classify_media.py：单日/调试运行
+
+```bash
+python classify_media.py     --images-root images/金价     --csv-root output/金价     --date 2022-01-01     --profile mac-cpu     --image-proto-root prototypes     --aggregation post     --output classified_posts.csv
+```
+
+常用参数：
+- `--aggregation {post,image}` 控制帖子级输出或逐图详情；
+- `--limit`、`--dry-run` 便于调试；
+- `--categories` 使用自定义 prompt；
+- `--profile/--device/--model` 控制硬件与 CLIP 版本；
+- `--image-proto-root` 指向人工原型目录。
+
+### batch_classify.py：批量产出
+
+```bash
+python batch_classify.py     --csv-root output/金价     --images-root images/金价     --output-root batch_results     --profile mac-cpu     --image-proto-root prototypes     --keep-image-level
+```
+
+输出：
+- `batch_results/posts/DATE.csv`：帖子级结果（模态、细粒度标签、情绪、置信度、OCR 预览等）；
+- `batch_results/images/DATE.csv`（若加 `--keep-image-level`）：逐图调试记录；
+- `batch_results/summary.csv`：日期层面的处理统计。
+
+### quality_report.py：质量巡检
+
+```bash
+python quality_report.py     --posts batch_results/posts/2022-01-01.csv     --images batch_results/images/2022-01-01.csv     --ground-truth ground_truth_template.csv     --sample-size 30     --output quality_report.json     --sample-output quality_samples.csv
+```
+
+- 统计模态/情绪/细类分布；
+- 支持与人工标注对比计算准确率、宏 F1；
+- 输出低置信度样本抽样清单，辅助人工复核。
+
+### extract_features.py：生成时间序列特征
+
+```bash
+python extract_features.py     --csv-root output/金价     --images-root images/金价     --profile mac-cpu     --image-proto-root prototypes     --output feature_exports/gold_features_daily.csv
+```
+
+产物：
+- `feature_exports/gold_features_daily.csv`：按日聚合的特征表，包含帖子量、模态分布、细粒度标签/情绪占比、OCR 统计等；
+- `feature_exports/quality_samples.csv`：抽样复核列表。
+
+可将特征 CSV 拷贝或链接到 `/Users/mac/Documents/computerscience/1基于/1GoldPred/data/external/`，供 TFT、LSTM 等模型直接加载。
+
+### 迁移到其他项目/关键词
+
+1. 准备新的 `output/<新关键词>`、`images/<新关键词>` 数据；
+2. 在 `prototypes/` 中添加对应类别原型或新的 prompt；
+3. 调整脚本参数（如 `--csv-root`、`--images-root`、`--image-proto-root`），即可复用分类与特征流程；
+4. 将 `extract_features.py` 输出的日度特征导入目标项目即可用于后续建模；
+5. 结合 `ground_truth_template.csv` 与 `quality_report.py` 持续扩充人工标注、监控质量。

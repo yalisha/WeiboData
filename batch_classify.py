@@ -34,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--images-root", type=Path, default=None, help="Root directory for downloaded images (optional).")
     parser.add_argument("--output-root", type=Path, default=Path("batch_results"), help="Directory to store aggregated outputs.")
     parser.add_argument("--date", action="append", help="Specific YYYY-MM-DD date(s) to process; repeatable.")
+    parser.add_argument("--start-date", help="Inclusive start date (YYYY-MM-DD). Process all available dates if omitted.")
+    parser.add_argument("--end-date", help="Inclusive end date (YYYY-MM-DD). Process all available dates if omitted.")
     parser.add_argument("--limit", type=int, default=None, help="Optional cap on number of posts/images per run (debug).")
     parser.add_argument("--profile", default="auto", choices=["auto", "mac-cpu", "mac-mps", "gpu-server"], help="Hardware preset for CLIP inference.")
     parser.add_argument("--device", default="auto", help="Torch device string to override `--profile`.")
@@ -53,10 +55,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def discover_dates(csv_root: Path, selected: Optional[Iterable[str]]) -> List[str]:
+def discover_dates(
+    csv_root: Path,
+    selected: Optional[Iterable[str]] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> List[str]:
     if selected:
-        return sorted(set(selected))
-    return sorted(p.stem for p in csv_root.glob("*.csv"))
+        candidates = sorted(set(selected))
+    else:
+        candidates = sorted(p.stem for p in csv_root.glob("*.csv"))
+
+    if start is None and end is None:
+        return candidates
+
+    filtered: List[str] = []
+    for date in candidates:
+        if start and date < start:
+            continue
+        if end and date > end:
+            continue
+        filtered.append(date)
+    return filtered
 
 
 def build_args(base: argparse.Namespace, date: str, aggregation: str, output_path: Path) -> argparse.Namespace:
@@ -96,7 +116,12 @@ def main() -> int:
     output_root = args.output_root
     output_root.mkdir(parents=True, exist_ok=True)
 
-    dates = discover_dates(args.csv_root, args.date)
+    dates = discover_dates(
+        args.csv_root,
+        selected=args.date,
+        start=args.start_date,
+        end=args.end_date,
+    )
     if not dates:
         raise SystemExit("No CSV files discovered to process.")
 
