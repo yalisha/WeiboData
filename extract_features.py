@@ -98,7 +98,12 @@ def aggregate_daily_features(posts_df: pd.DataFrame) -> pd.DataFrame:
 
     cat_counts = df.pivot_table(index="day", columns="image_main_category", values="post_id", aggfunc="count", fill_value=0)
     detail_counts = load_json_column(df["image_detail_counts"]).groupby(df["day"]).sum()
+    if not detail_counts.empty:
+        detail_counts = detail_counts.rename(columns={col: f"count_{col}" for col in detail_counts.columns})
+
     detail_conf = load_json_column(df["image_detail_confidence"]).groupby(df["day"]).mean()
+    if not detail_conf.empty:
+        detail_conf = detail_conf.rename(columns={col: f"conf_{col}" for col in detail_conf.columns})
 
     sentiment_counts = df.pivot_table(index="day", columns="text_sentiment", values="post_id", aggfunc="count", fill_value=0)
     memo_cols = [col for col in sentiment_counts.columns if col not in DEFAULT_IGNORE["text_sentiment"]]
@@ -123,11 +128,12 @@ def aggregate_daily_features(posts_df: pd.DataFrame) -> pd.DataFrame:
 
     aggregated["images_per_post"] = aggregated.apply(lambda row: row["images_classified_sum"] / row["posts"] if row["posts"] else 0, axis=1)
 
-    detail_cols = [col for col in aggregated.columns if col.startswith("technical_chart.") or col.startswith("news.") or col.startswith("gold_bullion.") or col.startswith("meme.")]
+    detail_cols = [col for col in aggregated.columns if col.startswith("count_")]
     if detail_cols:
         total_images = aggregated["images_classified_sum"].replace(0, pd.NA)
         for col in detail_cols:
-            aggregated[f"ratio_{col}"] = aggregated[col] / total_images
+            ratio_col = col.replace("count_", "ratio_", 1)
+            aggregated[ratio_col] = aggregated[col] / total_images
         aggregated = aggregated.fillna(0)
 
     return aggregated.reset_index().sort_values("day")
