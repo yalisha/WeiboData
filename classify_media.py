@@ -673,6 +673,94 @@ def determine_detail_for_image(
     return detail_tag, detail_scores, ocr_text
 
 
+def prepare_posts(args: argparse.Namespace) -> Tuple[
+    Dict[str, Sequence[str]],
+    List[Path],
+    List[PostRecord],
+    List[DataPoint],
+    Dict[str, int],
+]:
+    categories = load_category_prompts(args.categories)
+    csv_files = find_csv_files(args.csv_root, args.date)
+
+    post_limit = args.limit if args.aggregation == "post" else None
+    posts = collect_posts(csv_files, post_limit)
+
+    for post in posts:
+        post.text_analysis = analyze_text(post.text)
+        post.modality = determine_modality(post)
+
+    image_limit = args.limit if args.aggregation == "image" else None
+    datapoints = build_image_datapoints(posts, image_limit)
+
+    stats = {
+        "csv_files": len(csv_files),
+        "posts": len(posts),
+        "posts_with_images": sum(1 for post in posts if post.has_image()),
+        "images": len(datapoints),
+    }
+
+    return categories, csv_files, posts, datapoints, stats
+
+
+def run_classification(args: argparse.Namespace) -> Tuple[
+    Dict[str, int],
+    List[PostRecord],
+    List[DataPoint],
+    Optional[pd.DataFrame],
+    Optional[pd.DataFrame],
+]:
+    categories, csv_files, posts, datapoints, stats = prepare_posts(args)
+
+    if args.dry_run:
+        return stats, posts, datapoints, None, None
+
+    image_results: List[ClassificationResult] = []
+    detail_prototypes: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    if datapoints:
+        device = resolve_device(args.device, args.profile)
+        model_name, pretrained = resolve_model_and_pretrained(
+            args.model, args.pretrained, args.profile, device
+        )
+        batch_size = resolve_batch_size(args.batch_size, args.profile, device)
+
+        LOGGER.info("使用计算设备: %s", device)
+        LOGGER.info("加载模型: %s (%s), batch_size=%d", model_name, pretrained, batch_size)
+
+        model, preprocess, tokenizer = load_model_and_tokenizer(model_name, pretrained, device)
+        prototypes, detail_prototypes = encode_category_prototypes(
+            model=model,
+            tokenizer=tokenizer,
+            categories=categories,
+            device=device,
+            preprocess=preprocess,
+            image_proto_root=args.image_proto_root,
+            proto_text_weight=args.proto_text_weight,
+            proto_image_weight=args.proto_image_weight,
+        )
+        image_results = classify_datapoints(
+            datapoints=datapoints,
+            model=model,
+            tokenizer=tokenizer,
+            preprocess=preprocess,
+            device=device,
+            prototypes=prototypes,
+            detail_prototypes=detail_prototypes,
+            text_weight=args.text_weight,
+            batch_size=batch_size,
+            min_confidence=args.min_confidence,
+            min_gap=args.min_gap,
+        )
+        images_df = results_to_dataframe(image_results)
+    else:
+        images_df = results_to_dataframe([])
+
+    posts_df = aggregate_posts_to_dataframe(posts, image_results)
+
+    return stats, posts, datapoints, posts_df, images_df
+
+
 def load_category_prompts(custom: Optional[Path]) -> Dict[str, Sequence[str]]:
     if custom is None:
         return DEFAULT_CATEGORY_PROMPTS
@@ -1042,8 +1130,6 @@ def classify_datapoints(
 
 
 def results_to_dataframe(results: Sequence[ClassificationResult]) -> pd.DataFrame:
-    if not results:
-        raise RuntimeError("No classification results produced.")
     records = []
     for res in results:
         post = res.post
@@ -1213,29 +1299,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     setup_logging(args.verbose)
 
-    categories = load_category_prompts(args.categories)
-    csv_files = find_csv_files(args.csv_root, args.date)
-    post_limit = args.limit if args.aggregation == "post" else None
-    posts = collect_posts(csv_files, post_limit)
+    stats, posts, datapoints, posts_df, images_df = run_classification(args)
 
-    for post in posts:
-        post.text_analysis = analyze_text(post.text)
-        post.modality = determine_modality(post)
-
-    image_limit = args.limit if args.aggregation == "image" else None
-    datapoints = build_image_datapoints(posts, image_limit)
-
-    posts_with_images = sum(1 for post in posts if post.has_image())
     LOGGER.info(
         "Loaded %d posts (%d with images) from %d CSV files; total images queued=%d",
-        len(posts),
-        posts_with_images,
-        len(csv_files),
-        len(datapoints),
+        stats["posts"],
+        stats["posts_with_images"],
+        stats["csv_files"],
+        stats["images"],
     )
 
     if args.dry_run:
-        preview_count = min(len(posts), args.limit or 10)
+        preview_count = min(stats["posts"], args.limit or 10)
         for post in posts[:preview_count]:
             text_info = post.text_analysis or analyze_text(post.text)
             LOGGER.info(
@@ -1256,51 +1331,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOGGER.info("Dry run complete; exiting without classification.")
         return 0
 
-    image_results: List[ClassificationResult] = []
-
-    if datapoints:
-        device = resolve_device(args.device, args.profile)
-        model_name, pretrained = resolve_model_and_pretrained(
-            args.model, args.pretrained, args.profile, device
-        )
-        batch_size = resolve_batch_size(args.batch_size, args.profile, device)
-
-        LOGGER.info("使用计算设备: %s", device)
-        LOGGER.info("加载模型: %s (%s), batch_size=%d", model_name, pretrained, batch_size)
-
-        model, preprocess, tokenizer = load_model_and_tokenizer(model_name, pretrained, device)
-        prototypes, detail_prototypes = encode_category_prototypes(
-            model=model,
-            tokenizer=tokenizer,
-            categories=categories,
-            device=device,
-            preprocess=preprocess,
-            image_proto_root=args.image_proto_root,
-            proto_text_weight=args.proto_text_weight,
-            proto_image_weight=args.proto_image_weight,
-        )
-        image_results = classify_datapoints(
-            datapoints=datapoints,
-            model=model,
-            tokenizer=tokenizer,
-            preprocess=preprocess,
-            device=device,
-            prototypes=prototypes,
-            detail_prototypes=detail_prototypes,
-            text_weight=args.text_weight,
-            batch_size=batch_size,
-            min_confidence=args.min_confidence,
-            min_gap=args.min_gap,
-        )
-    else:
-        LOGGER.info("No images detected in selected posts; skipping image classification stage.")
-
     if args.aggregation == "image":
-        if not image_results:
+        if images_df is None or images_df.empty:
             raise RuntimeError("Image aggregation requested but no image results were produced.")
-        df = results_to_dataframe(image_results)
+        df = images_df
     else:
-        df = aggregate_posts_to_dataframe(posts, image_results)
+        if posts_df is None:
+            raise RuntimeError("Post aggregation failed to produce results.")
+        df = posts_df
     args.output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.output, index=False)
     LOGGER.info("Wrote %s", args.output)

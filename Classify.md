@@ -40,6 +40,35 @@
 - `meme`：综合 OCR 文本与帖子文本进行情绪分析（`meme.positive/negative/neutral`），并记录 CLIP 细类得分辅助人工复核。
 - 每张图片的细粒度信息通过 `detail_tag`、`detail_scores`、`ocr_text_*` 字段输出；帖子级 CSV 会聚合细类计数、平均置信度以及 OCR 预览，方便后续特征抽取。
 
+## 阶段 4：结果汇总与验证
+
+- `batch_classify.py` 封装批量流程：
+  ```bash
+  python batch_classify.py \
+      --csv-root output/金价 \
+      --images-root images/金价 \
+      --output-root batch_results \
+      --profile mac-cpu \
+      --image-proto-root prototypes \
+      --keep-image-level
+  ```
+  会在 `batch_results/` 下生成：
+  - `posts/DATE.csv`：每个 `post_id` 一行，包含模态、文本情绪、图像主/细类、置信度、OCR 预览等字段；
+  - `images/DATE.csv`（若加 `--keep-image-level`）：保留逐图详情便于调试；
+  - `summary.csv`：按日期汇总处理条数、图像数量等元数据。
+- `quality_report.py` 用于质量巡检：
+  ```bash
+  python quality_report.py \
+      --posts batch_results/posts/2022-01-01.csv \
+      --images batch_results/images/2022-01-01.csv \
+      --sample-size 30 \
+      --output quality_report.json \
+      --sample-output quality_samples.csv
+  ```
+  - 输出 JSON 统计各模态/情绪/细类分布、置信度低的帖子数量；
+  - 可选 `--ground-truth` 传入人工标注（含 `post_id`、`expected_detail_tag` 等）计算准确率与宏 F1；
+  - 自动抽样易错样本，生成 `quality_samples.csv` 供人工复核。
+
 先安装依赖：pip install open_clip_torch torch torchvision pandas pillow tqdm（Mac M 系列需对应的 torch 轮子，可选 pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu；若要用 MPS，安装官方 CPU/MPS 版）。
 本地 Mac 无 GPU 时推荐：python classify_media.py --profile mac-cpu --date 2022-01-01 --limit 10。若已开启 Apple MPS，则改用 --profile mac-mps。
 迁移到服务器后，直接切换命令为：python classify_media.py --profile gpu-server --date 2022-01-01 --output classified_20220101.csv，脚本会自动用 CUDA + ViT-L/14，大幅加速。
