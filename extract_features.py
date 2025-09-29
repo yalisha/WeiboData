@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--csv-root", type=Path, default=Path("output/金价"), help="Directory containing per-day CSV exports.")
     parser.add_argument("--images-root", type=Path, default=Path("images/金价"), help="Root directory containing images.")
     parser.add_argument("--output", type=Path, default=Path("feature_exports/gold_features_daily.csv"), help="Where to write aggregated daily features.")
-    parser.add_argument("--profile", default="mac-cpu", choices=["auto", "mac-cpu", "mac-mps", "gpu-server"], help="Hardware preset passed to classify_media.")
+    parser.add_argument("--profile", default="auto", choices=["auto", "mac-cpu", "mac-mps", "gpu-server"], help="Hardware preset passed to classify_media.")
     parser.add_argument("--device", default="auto", help="Torch device override (optional).")
     parser.add_argument("--model", default=None, help="CLIP model architecture name.")
     parser.add_argument("--pretrained", default=None, help="Pretrained weights tag.")
@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quality-sample", type=int, default=10, help="Number of rows to sample for manual QA (written to feature_exports/quality_samples.csv).")
     parser.add_argument("--quality-threshold", type=float, default=0.55, help="Confidence threshold for QA sampling.")
     parser.add_argument("--quiet", action="store_true", help="Suppress intermediate prints.")
+    parser.add_argument("--enable-interactions", action="store_true", help="Derive interaction features between sentiment, topics, and image categories.")
     return parser.parse_args()
 
 
@@ -58,7 +59,7 @@ def discover_dates(csv_root: Path, start: Optional[str], end: Optional[str]) -> 
     return filtered
 
 
-def aggregate_daily_features(posts_df: pd.DataFrame) -> pd.DataFrame:
+def aggregate_daily_features(posts_df: pd.DataFrame, enable_interactions: bool = False) -> pd.DataFrame:
     if posts_df.empty:
         return pd.DataFrame()
 
@@ -123,6 +124,12 @@ def aggregate_daily_features(posts_df: pd.DataFrame) -> pd.DataFrame:
 
     aggregated = aggregated.fillna(0)
 
+    if enable_interactions:
+        interactions = _derive_interaction_features(df)
+        for block in interactions:
+            if not block.empty:
+                aggregated = aggregated.join(block, how="left").fillna(0)
+
     if aggregated.empty:
         return aggregated
 
@@ -137,6 +144,83 @@ def aggregate_daily_features(posts_df: pd.DataFrame) -> pd.DataFrame:
         aggregated = aggregated.fillna(0)
 
     return aggregated.reset_index().sort_values("day")
+
+
+def _derive_interaction_features(posts_df: pd.DataFrame) -> list[pd.DataFrame]:
+    interactions: list[pd.DataFrame] = []
+
+    sentiment_topics = _sentiment_topic_interactions(posts_df)
+    if not sentiment_topics.empty:
+        interactions.append(sentiment_topics)
+
+    sentiment_images = _sentiment_image_interactions(posts_df)
+    if not sentiment_images.empty:
+        interactions.append(sentiment_images)
+
+    topic_images = _topic_image_interactions(posts_df)
+    if not topic_images.empty:
+        interactions.append(topic_images)
+
+    return interactions
+
+
+def _sentiment_topic_interactions(posts_df: pd.DataFrame) -> pd.DataFrame:
+    exploded = posts_df.assign(
+        __topic_list=posts_df["text_topics"].fillna("").astype(str).str.split(";")
+    ).explode("__topic_list")
+    exploded["__topic_list"] = exploded["__topic_list"].str.strip()
+    exploded = exploded[exploded["__topic_list"].astype(bool)]
+    if exploded.empty:
+        return pd.DataFrame()
+
+    exploded["text_sentiment"] = exploded["text_sentiment"].fillna("none").astype(str)
+
+    counts = (
+        exploded.groupby(["day", "text_sentiment", "__topic_list"]).size().unstack(["text_sentiment", "__topic_list"], fill_value=0)
+    )
+    counts.columns = [
+        f"sent_{sent}_topic_{topic}" for sent, topic in counts.columns
+    ]
+    return counts
+
+
+def _sentiment_image_interactions(posts_df: pd.DataFrame) -> pd.DataFrame:
+    valid = posts_df.dropna(subset=["text_sentiment", "image_main_category"])
+    if valid.empty:
+        return pd.DataFrame()
+
+    valid = valid.assign(text_sentiment=valid["text_sentiment"].fillna("none").astype(str))
+
+    counts = (
+        valid.groupby(["day", "text_sentiment", "image_main_category"])  # type: ignore[arg-type]
+        .size()
+        .unstack(["text_sentiment", "image_main_category"], fill_value=0)
+    )
+    counts.columns = [
+        f"sent_{sent}_image_{category}" for sent, category in counts.columns
+    ]
+    return counts
+
+
+def _topic_image_interactions(posts_df: pd.DataFrame) -> pd.DataFrame:
+    exploded = posts_df.assign(
+        __topic_list=posts_df["text_topics"].fillna("").astype(str).str.split(";")
+    ).explode("__topic_list")
+    exploded["__topic_list"] = exploded["__topic_list"].str.strip()
+    exploded = exploded[exploded["__topic_list"].astype(bool)]
+    exploded = exploded.dropna(subset=["image_main_category"])
+    if exploded.empty:
+        return pd.DataFrame()
+
+    exploded["text_sentiment"] = exploded["text_sentiment"].fillna("none").astype(str)
+
+    counts = (
+        exploded.groupby(["day", "__topic_list", "image_main_category"]).size().unstack(["__topic_list", "image_main_category"], fill_value=0)
+    )
+    counts.columns = [
+        f"topic_{topic}_image_{category}" for topic, category in counts.columns
+    ]
+    return counts
 
 
 def sample_for_quality(posts_df: pd.DataFrame, threshold: float, sample_size: int) -> pd.DataFrame:
@@ -206,7 +290,7 @@ def main() -> int:
         if posts_df is None or posts_df.empty:
             continue
 
-        features = aggregate_daily_features(posts_df)
+        features = aggregate_daily_features(posts_df, enable_interactions=args.enable_interactions)
         if not features.empty:
             all_features.append(features)
 
@@ -223,6 +307,7 @@ def main() -> int:
 
     feature_table = pd.concat(all_features, ignore_index=True)
     feature_table = feature_table.sort_values("day")
+    feature_table = feature_table.loc[:, ~feature_table.columns.str.contains(r"^Unnamed")]  # drop stray empty columns
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     feature_table.to_csv(args.output, index=False)
