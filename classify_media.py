@@ -1165,16 +1165,23 @@ def results_to_dataframe(results: Sequence[ClassificationResult]) -> pd.DataFram
 
 def summarise_image_results(results: Sequence[ClassificationResult]) -> Dict[str, Any]:
     if not results:
+        empty_json = json.dumps({}, ensure_ascii=False)
         return {
             "image_main_category": "",
             "image_detail_tag": "",
             "image_main_confidence": 0.0,
             "images_classified": 0,
-            "image_category_counts": json.dumps({}, ensure_ascii=False),
-            "image_category_confidence": json.dumps({}, ensure_ascii=False),
+            "image_category_counts": empty_json,
+            "image_category_confidence": empty_json,
+            "image_detail_counts": empty_json,
+            "image_detail_confidence": empty_json,
+            "image_detail_metadata": empty_json,
             "image_low_confidence_count": 0,
             "image_used_text_ratio": 0.0,
+            "image_ocr_preview": "",
+            "image_ocr_count": 0,
         }
+
 
     count_by_cat: Dict[str, int] = defaultdict(int)
     confidence_sum: Dict[str, float] = defaultdict(float)
